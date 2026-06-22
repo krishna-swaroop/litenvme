@@ -476,7 +476,7 @@ def main():
         cfg = dict(core_config, _cpu_firmware=cpu_firmware)
         soc     = LiteNVMeCore(platform, cfg)
         builder = Builder(soc, output_dir=args.output_dir, compile_gateware=False)
-        builder.build(build_name=build_name, regular_comb=False)
+        builder.build(build_name=build_name)
         return soc, builder
 
     if core_config.get("cpu", "vexriscv") is not None and firmware in ("auto", "minimal"):
