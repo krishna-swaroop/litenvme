@@ -415,6 +415,7 @@ class LiteNVMeHostMemDMA(LiteXModule):
         lat_tag    = Signal(8)
         lat_len_dw = Signal(10)
         lat_req_id = Signal(16)
+        lat_lower  = Signal(7)
 
         cur_word    = Signal(32)
         beats_total = Signal(16)
@@ -463,6 +464,14 @@ class LiteNVMeHostMemDMA(LiteXModule):
             self.comb += cmp.cmp_id.eq(0)
         if hasattr(cmp, "err"):
             self.comb += cmp.err.eq(0)
+        # Raw-TLP PHYs (7-series shared channel) take the CplD header's Byte Count and
+        # Lower Address fields directly from the port, unlike the USP CC adapter which
+        # derives them in the hard IP. Byte Count = total bytes of this (single, complete)
+        # completion; 0 would mean 4096 remaining and stall the requester's read forever.
+        if hasattr(cmp, "byte_count"):
+            self.comb += cmp.byte_count.eq(lat_len_dw << 2)
+        if hasattr(cmp, "adr"):
+            self.comb += cmp.adr.eq(lat_lower)
 
         pop = Signal()
         self.comb += pop.eq(cmp.valid & cmp.ready)
@@ -564,6 +573,7 @@ class LiteNVMeHostMemDMA(LiteXModule):
 
         def latch_req_header():
             stmts = [NextValue(cur_word, (req.adr - base) >> beat_bytes_shift)]
+            stmts += [NextValue(lat_lower, req.adr[:7])]
             if has_tag:
                 stmts += [NextValue(lat_tag, req.tag)]
             else:
