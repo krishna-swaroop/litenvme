@@ -26,8 +26,8 @@ It mirrors exactly what the firmware does, but as a tight hardware loop, and let
 
 Interfaces
 ----------
-- `sink`   (stream): incoming request descriptors {op, nsid, lba, nlb, buf}.
-- `source` (stream): outgoing completion descriptors {cid, status, sqhd}.
+- `sink`   (stream): incoming request descriptors {op, nsid, lba, nlb, buf, tag}.
+- `source` (stream): outgoing completion descriptors {cid, status, sqhd, tag}.
 - `mmio`   : drives a LiteNVMePCIeMmioAccessor (doorbell writes). Connect in the SoC:
                 self.comb += engine.connect_mmio(self.mmio)
 - `mem`    : LiteNVMeMemPort, a simple 32-bit dword host-memory access port used to write
@@ -92,6 +92,8 @@ CQE_DWORDS = 4    # 16 B completion queue entry.
 
 # Descriptor layouts -------------------------------------------------------------------------------
 
+TAG_WIDTH = 8
+
 def request_layout():
     return [
         ("op",   1),    # 0 = read, 1 = write.
@@ -99,6 +101,7 @@ def request_layout():
         ("lba",  64),
         ("nlb",  16),   # number of blocks (1-based; engine writes nlb-1 on the wire).
         ("buf",  64),   # PRP1 host-memory buffer address.
+        ("tag",  TAG_WIDTH),  # opaque front-end tag, returned with the matching completion.
     ]
 
 def completion_layout():
@@ -106,6 +109,7 @@ def completion_layout():
         ("cid",    16),
         ("status", 16),  # CQE status field (dw3[31:16]); success when SC/SCT == 0.
         ("sqhd",   16),
+        ("tag",    TAG_WIDTH),  # tag of the request this completion belongs to.
     ]
 
 # Host-memory access port --------------------------------------------------------------------------
@@ -206,6 +210,7 @@ class LiteNVMeIOEngine(LiteXModule):
         req_nlb  = Signal(16)
         req_buf  = Signal(64)
         req_cid  = Signal(16)
+        req_tag  = Signal(TAG_WIDTH)
 
         # PRP fields (computed at LATCH-REQ, then latched). Assumes the data buffer is
         # physically contiguous and page-aligned starting at `buf`:
@@ -307,6 +312,11 @@ class LiteNVMeIOEngine(LiteXModule):
         # cleared when its CQE is reaped; submit is gated on the target CID being free.
         slot_busy = Array(Signal() for _ in range(qsize))
 
+        # Per-slot (== per-CID) front-end tag, stored at submit and returned with the CQE, so a
+        # front-end can match completions (which the device may return in any order) to its own
+        # buffers without predicting the engine's CID allocation.
+        slot_tag = Array(Signal(TAG_WIDTH) for _ in range(qsize))
+
         # Can we submit a new command? Room in the in-flight window, a request waiting, AND
         # the CID we're about to use (sq_tail) is not still outstanding at the device.
         self.can_submit = can_submit = Signal()
@@ -355,6 +365,7 @@ class LiteNVMeIOEngine(LiteXModule):
             NextValue(req_nlb,  self.sink.nlb),
             NextValue(req_buf,  self.sink.buf),
             NextValue(req_cid,  sq_tail),
+            NextValue(req_tag,  self.sink.tag),
             NextValue(req_prp2,      s_prp2),
             NextValue(req_need_list, s_need_list),
             NextValue(req_nlist,     s_npages - 1),
@@ -406,6 +417,7 @@ class LiteNVMeIOEngine(LiteXModule):
             self.sink.ready.eq(1),  # request consumed (latched).
             ring_inc(sq_tail),
             NextValue(slot_busy[sq_tail], 1),  # mark this CID (= sq_tail) outstanding.
+            NextValue(slot_tag[sq_tail], req_tag),
             NextValue(self.inflight, self.inflight + 1),
             NextValue(self.submitted, self.submitted + 1),
             NextState("IDLE"),
@@ -487,6 +499,7 @@ class LiteNVMeIOEngine(LiteXModule):
             self.source.cid.eq(cqe_cid),
             self.source.status.eq(cqe_sts),
             self.source.sqhd.eq(cqe_sqhd),
+            self.source.tag.eq(slot_tag[cqe_cid]),
             If(self.source.ready,
                 NextValue(self.inflight, self.inflight - 1),
                 NextValue(self.completed, self.completed + 1),
