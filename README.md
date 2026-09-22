@@ -49,6 +49,8 @@ Core:
 
 Frontend:
   - AXI-Stream block read/write interface.
+  - Stream ring front-end: chunked, overlapped AXI-Stream read/write (simulation only).
+  - Position-encoded pattern generator/checker for SSD round-trip tests.
   - CSR/software control for LiteX SoCs.
   - Standalone Verilog generator with YAML configuration.
   - Reference Alibaba KU3P test SoC and bench scripts.
@@ -123,6 +125,7 @@ $ ./bench/hw_rtlinit.sh
 - `doc/DIAGRAMS.md`: Visual architecture diagrams.
 - `doc/ARCHITECTURE.md`: As-built Gen3-256b architecture.
 - `doc/STANDALONE_CORE.md`: Standalone generation, interface, resources and usage.
+- `doc/STREAMER.md`: Stream ring front-end, pattern generator/checker and their tests.
 - `doc/NVME_PERFORMANCE.md`: Throughput study and measured limits.
 - `doc/VALIDATION.md`: Simulation, generator and hardware-validation evidence.
 - `doc/NVME_CORE_COMPARISON.md`: Comparison with other public NVMe cores.
