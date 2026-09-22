@@ -91,6 +91,8 @@ class LiteNVMe(LiteXModule):
                  hostmem_backend=None, with_request_gen=False,
                  with_block_streamer=False, block_streamer_csr=True, with_hostmem_csr=True,
                  staging_base=0x4_0000, staging_size=0x4_0000, with_csr=True,
+                 with_streamer=False, streamer_csr=True, streamer_base=0x2000_0000,
+                 streamer_nslots=8, streamer_slot_bytes=0x8000, streamer_backend=None,
                  with_accessor_csr=None, with_engine_csr=None, with_request_gen_csr=None,
                  extra_axi_masters=None):
         # hostmem_backend: optional pre-built host-memory backend exposing a matching
@@ -170,6 +172,34 @@ class LiteNVMe(LiteXModule):
             )
             hostmem_axi_masters.append(block_streamer.dma.axi)
 
+        # Optional stream-ring front-end (sustained, overlapped AXI-Stream write/read). Its slot
+        # ring lives in a separate host-memory region with its own responder on a second
+        # crossbar slave port, so user data never shares the backend with SQE/CQE traffic.
+        if with_streamer:
+            from litenvme.streamer import LiteNVMeStreamer
+            self.streamer = streamer = LiteNVMeStreamer(
+                data_width = data_width,
+                buf_base   = streamer_base,
+                nslots     = streamer_nslots,
+                slot_bytes = streamer_slot_bytes,
+                with_csr   = streamer_csr,
+            )
+            streamer_size = streamer.size
+            assert (streamer_base + streamer_size <= hostmem_base) or \
+                   (hostmem_base + hostmem_size <= streamer_base), "streamer region overlaps hostmem"
+            def streamer_decoder(a):
+                return (a >= streamer_base) & (a < (streamer_base + streamer_size))
+            self.streamer_port = endpoint.crossbar.get_slave_port(address_decoder=streamer_decoder)
+            self.streamer_mem  = LiteNVMeHostMemResponder(
+                port              = self.streamer_port,
+                base              = streamer_base,
+                size              = streamer_size,
+                data_width        = data_width,
+                with_csr          = False,
+                extra_axi_masters = [streamer.dma.axi],
+                backend           = streamer_backend,
+            )
+
         # Host-memory responder; the engine + front-ends join the AXI backend as masters.
         def hostmem_decoder(a):
             return (a >= hostmem_base) & (a < (hostmem_base + hostmem_size))
@@ -195,17 +225,14 @@ class LiteNVMe(LiteXModule):
         # Front-end -> engine connection. When a single front-end is present it owns the
         # engine streams; when several are present (test SoC), the SoC wires the mux and the
         # raw engine streams are re-exported here for it.
-        if with_block_streamer and not with_request_gen:
+        front_ends = []
+        if with_block_streamer: front_ends.append(block_streamer)
+        if with_request_gen:    front_ends.append(request_gen)
+        if with_streamer:       front_ends.append(streamer)
+        if len(front_ends) == 1:
             self.comb += [
-                block_streamer.source.connect(io_engine.sink),
-                io_engine.source.connect(block_streamer.sink),
-            ]
-            self.request    = None
-            self.completion = None
-        elif with_request_gen and not with_block_streamer:
-            self.comb += [
-                request_gen.source.connect(io_engine.sink),
-                io_engine.source.connect(request_gen.sink),
+                front_ends[0].source.connect(io_engine.sink),
+                io_engine.source.connect(front_ends[0].sink),
             ]
             self.request    = None
             self.completion = None
@@ -232,3 +259,5 @@ class LiteNVMe(LiteXModule):
             soc.add_module(name=f"{name}_gen",   module=self.request_gen)
         if hasattr(self, "block_streamer") and hasattr(self.block_streamer, "_ctrl"):
             soc.add_module(name=f"{name}_block", module=self.block_streamer)
+        if hasattr(self, "streamer") and hasattr(self.streamer, "_ctrl"):
+            soc.add_module(name=f"{name}_streamer", module=self.streamer)
