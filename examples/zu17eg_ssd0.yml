@@ -1,0 +1,51 @@
+# LiteNVMe standalone core — custom XCZU17EG SoM, SSD0 (GTH quad 229 / PCIe block X1Y1),
+# PCIe Gen3 x4, 256-bit datapath, externally controlled (Zynq PS or MicroBlaze over AXI-Lite).
+# Generate with:  litenvme_gen examples/zu17eg_ssd0.yml --output-dir build/zu17eg_ssd0
+#
+# Placement (quad/block/PLL) follows the board's reference design. Refclk and PERST# pins are
+# board constraints applied in the Vivado project, not here.
+{
+    # PCIe PHY (RootPort).
+    "phy"           : "USPPCIEPHY",
+    "phy_device"    : "xczu17eg-ffvc1760-2-i",
+    "phy_lanes"     : 4,
+    "phy_speed"     : "gen3",
+    "phy_ip_name"   : "pcie4_uscale_plus",
+    "data_width"    : 256,
+    "ep_max_pending_requests" : 8,
+    "phy_config"    : {
+        "mode_selection"  : "Advanced",
+        "en_gt_selection" : "true",
+        "select_quad"     : "GTH_Quad_229",
+        "pcie_blk_locn"   : "X1Y1",
+        "plltype"         : "QPLL1",
+        "axisten_freq"    : 125,   # 256b @ 125MHz = 4.0 GB/s user datapath.
+        "coreclk_freq"    : 250,
+    },
+
+    # Clocking: sys clock provided by the integrator (free-running, e.g. a 125 MHz PL clock),
+    # so the AXI-Lite control port keeps working while the PCIe link is down or in reset.
+    "clk_freq"            : 125e6,
+    "clk_external"        : True,
+    "pcie_rst_resets_sys" : False,
+
+    # Bring-up: no soft-CPU; the PS/MicroBlaze runs software/litenvme over the csr_axil port.
+    "init_mode"     : "external",
+
+    # I/O engine + queue/PRP host-memory window (small: data lives in the stream ring).
+    "qid"           : 1,
+    "qsize"         : 16,
+    "qd"            : 15,
+    "hostmem_base"  : 0x10000000,
+    "hostmem_size"  : 0x8000,
+    "bar0_base"     : 0xe0000000,
+
+    # Stream ring front-end: 8 x 32 KiB slots in their own host-memory region, CSR-driven
+    # commands, AXI-Stream data pins plus the built-in pattern generator/checker.
+    "with_streamer"       : True,
+    "streamer_ctrl"       : "csr",
+    "streamer_base"       : 0x20000000,
+    "streamer_nslots"     : 8,
+    "streamer_slot_bytes" : 0x8000,
+    "with_stream_pattern" : True,
+}

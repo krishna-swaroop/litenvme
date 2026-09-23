@@ -22,6 +22,11 @@ soft-CPU or from the pure-RTL init sequencer. Steady-state block I/O is exposed 
 LiteSATA-style block-streaming interface plus simple control/status pins. The configuration is
 described by a YAML file, mirroring litedram_gen / litepcie_gen.
 
+init_mode="external" omits the soft-CPU and exposes the core's CSR bus as an AXI-Lite slave
+(`csr_axil`), so an external processor (Zynq PS, MicroBlaze, ...) runs the one-time bring-up
+while the PL owns the data path. Combine it with `with_streamer` for the stream ring front-end
+(AXI-Stream write/read pins, optional built-in pattern generator/checker).
+
 Current version targets Xilinx Ultrascale+ (USPPCIEPHY, pcie4_uscale_plus).
 """
 
@@ -37,6 +42,7 @@ from litex.gen import *
 from litex.gen.genlib.misc import WaitTimer
 
 from litex.soc.interconnect.csr     import *
+from litex.soc.interconnect         import axi
 from litex.soc.integration.soc_core import SoCCore
 from litex.soc.integration.builder  import Builder
 
@@ -109,11 +115,80 @@ def get_block_ios(data_width):
         ),
     ]
 
+def get_stream_ctrl_ios():
+    # Stream ring command/status (only when streamer_ctrl="pins"; otherwise CSR-driven).
+    return [
+        ("stream_ctrl", 0,
+            Subsignal("start", Pins(1)),
+            Subsignal("write", Pins(1)),   # 1 = write (stream->SSD), 0 = read.
+            Subsignal("lba",   Pins(64)),  # start LBA.
+            Subsignal("count", Pins(32)),  # number of logical blocks.
+            Subsignal("nsid",  Pins(32)),
+            Subsignal("done",  Pins(1)),
+            Subsignal("busy",  Pins(1)),
+            Subsignal("error", Pins(1)),
+        ),
+    ]
+
+def get_stream_ios(data_width):
+    # Stream ring data: write payload in / read payload out (AXI-Stream, sys clock domain).
+    return [
+        ("stream_wr_axis", 0,
+            Subsignal("tvalid", Pins(1)),
+            Subsignal("tready", Pins(1)),
+            Subsignal("tlast",  Pins(1)),
+            Subsignal("tdata",  Pins(data_width)),
+        ),
+        ("stream_rd_axis", 0,
+            Subsignal("tvalid", Pins(1)),
+            Subsignal("tready", Pins(1)),
+            Subsignal("tlast",  Pins(1)),
+            Subsignal("tdata",  Pins(data_width)),
+        ),
+    ]
+
+# Host-memory layout (init_mode="external") --------------------------------------------------------
+
+# Fixed layout of the queue/PRP host-memory window used by the external bring-up software
+# (exported as NVME_HOSTMEM_*_OFFSET constants in soc.h).
+HOSTMEM_ASQ_OFFSET = 0x0000
+HOSTMEM_ACQ_OFFSET = 0x1000
+HOSTMEM_ID_OFFSET  = 0x2000
+HOSTMEM_IOCQ_OFFSET = 0x3000
+HOSTMEM_IOSQ_OFFSET = 0x4000
+HOSTMEM_PRP_OFFSET  = 0x5000
+
+def streamer_prp_list_shift(slot_bytes, page_bytes=4096):
+    """Smallest per-slot PRP-list stride holding a slot's list (>= 8 B, <= one page)."""
+    entries = max(1, -(-slot_bytes // page_bytes) - 1)
+    shift = 3
+    while (1 << shift) < 8 * entries:
+        shift += 1
+    return shift
+
+# CSR Control --------------------------------------------------------------------------------------
+
+class LiteNVMePCIeControl(LiteXModule):
+    """Software control of the downstream PERST# (on top of the power-up one-shot timer)."""
+    def __init__(self):
+        self._ctrl = CSRStorage(fields=[
+            CSRField("perst", size=1, offset=0, description="Hold the SSD (and root port) in reset."),
+        ])
+        self.perst = self._ctrl.fields.perst
+
+class LiteNVMeStreamMux(LiteXModule):
+    """Select the stream ring data source/sink: 0 = AXI-Stream pins, 1 = pattern gen/checker."""
+    def __init__(self):
+        self._sel = CSRStorage(fields=[
+            CSRField("pattern", size=1, offset=0, description="1: pattern generator/checker."),
+        ])
+        self.pattern = self._sel.fields.pattern
+
 # CRG ----------------------------------------------------------------------------------------------
 
 class LiteNVMeCRG(LiteXModule):
     """Sys-clock from the PCIe user clock (internal) or from the user (external), like LitePCIe."""
-    def __init__(self, platform, clk_external):
+    def __init__(self, platform, clk_external, pcie_rst_resets_sys=True):
         self.cd_sys = ClockDomain()
 
         # # #
@@ -125,10 +200,12 @@ class LiteNVMeCRG(LiteXModule):
         pcie_clk = ClockSignal("pcie")
         pcie_rst = ResetSignal("pcie")
 
-        # External Clk mode: the system clock is provided by the user logic.
+        # External Clk mode: the system clock is provided by the user logic. With
+        # pcie_rst_resets_sys=False the sys domain (CSR bus included) stays out of reset while
+        # the PCIe link is down, so an external bus master never stalls on it.
         if clk_external:
             self.comb += self.cd_sys.clk.eq(clk)
-            self.specials += AsyncResetSynchronizer(self.cd_sys, rst | pcie_rst)
+            self.specials += AsyncResetSynchronizer(self.cd_sys, (rst | pcie_rst) if pcie_rst_resets_sys else rst)
 
         # Internal Clk mode: the core drives the system clock out from the PCIe user clock.
         else:
@@ -149,6 +226,7 @@ class LiteNVMeCore(SoCCore):
         # Parameters -------------------------------------------------------------------------------
         init_mode    = core_config.get("init_mode", "firmware")
         sys_clk_freq = float(core_config.get("clk_freq", 125e6))
+        external     = init_mode == "external"
         cpu_type     = core_config.get("cpu", "vexriscv" if init_mode == "firmware" else None)
         cpu_variant  = core_config.get("cpu_variant", "minimal")
         data_width   = core_config.get("data_width", 256)
@@ -157,7 +235,7 @@ class LiteNVMeCore(SoCCore):
         hostmem_base = core_config.get("hostmem_base", 0x1000_0000)
         hostmem_size = core_config.get("hostmem_size", 0x8_0000)
 
-        if uart_name == "serial":
+        if uart_name == "serial" and not external:
             platform.add_extension(get_uart_ios())
 
         # SoCCore (CPU embedded, like litedram) ----------------------------------------------------
@@ -168,6 +246,12 @@ class LiteNVMeCore(SoCCore):
             cpu_variant   = cpu_variant,
             uart_name     = uart_name,
         )
+        if external:
+            # No soft-CPU: the CSR bus is mastered from the AXI-Lite slave port, CSRs at 0x0.
+            soc_kwargs["with_uart"] = False
+            soc_kwargs["integrated_sram_size"] = 0
+            soc_kwargs.pop("uart_name")
+            self.mem_map = {"csr": 0x0000_0000}
         # firmware: "auto"/"minimal" bake the NVMe firmware into ROM (no main_ram); "none"
         # boots the LiteX BIOS (ROM + main_ram). The same memory map must hold across both
         # two-pass builds, so the ROM-boot layout is chosen from `firmware`, not from whether
@@ -184,7 +268,26 @@ class LiteNVMeCore(SoCCore):
         SoCCore.__init__(self, platform, sys_clk_freq, **soc_kwargs)
 
         # CRG --------------------------------------------------------------------------------------
-        self.crg = LiteNVMeCRG(platform, core_config.get("clk_external", False))
+        self.crg = LiteNVMeCRG(platform, core_config.get("clk_external", False),
+            pcie_rst_resets_sys = core_config.get("pcie_rst_resets_sys", True))
+
+        # AXI-Lite control slave (init_mode="external") ---------------------------------------------
+        if external:
+            aw   = core_config.get("csr_axil_address_width", 16)
+            pads_if = axi.AXILiteInterface(data_width=32, address_width=32)
+            platform.add_extension(pads_if.get_ios("csr_axil"))
+            self.csr_axil_pads = platform.request("csr_axil")
+            self.comb += pads_if.connect_to_pads(self.csr_axil_pads, mode="slave")
+            self.csr_axil = csr_axil = axi.AXILiteInterface(data_width=32, address_width=32)
+            # Only the low `aw` address bits are decoded (the CSR aperture), so the port works
+            # whether the interconnect presents full or window-relative addresses.
+            self.comb += pads_if.connect(csr_axil, omit={"addr"})
+            self.comb += [
+                csr_axil.aw.addr.eq(pads_if.aw.addr[:aw]),
+                csr_axil.ar.addr.eq(pads_if.ar.addr[:aw]),
+            ]
+            self.bus.add_master(name="csr_axil", master=csr_axil)
+            self.csr_axil_address_width = aw
 
         # PCIe PHY (RootPort) ----------------------------------------------------------------------
         pcie_pads       = platform.request("pcie")
@@ -203,11 +306,18 @@ class LiteNVMeCore(SoCCore):
         self.pcie_phy.update_config(core_config.get("phy_config", {}))
 
         # PCIe RootPort one-shot reset (we drive PERST# to the SSD after link-up settle).
-        self.pcie_rst_timer = WaitTimer(int(100e-3 * sys_clk_freq))  # 100ms.
+        perst_delay = float(core_config.get("pcie_perst_delay", 100e-3))  # seconds (100 ms).
+        self.pcie_rst_timer = WaitTimer(max(1, int(perst_delay * sys_clk_freq)))
         self.comb += self.pcie_rst_timer.wait.eq(1)
+        pcie_rst_n = Signal()
+        self.comb += pcie_rst_n.eq(self.pcie_rst_timer.done)
+        if external:
+            # Software can re-assert PERST# (SSD + root port reset) for recovery / re-training.
+            self.pcie_ctrl = LiteNVMePCIeControl()
+            self.comb += pcie_rst_n.eq(self.pcie_rst_timer.done & ~self.pcie_ctrl.perst)
         self.comb += [
-            pcie_pads_rst_n.eq(self.pcie_rst_timer.done),
-            pcie_pads.rst_n.eq(self.pcie_rst_timer.done),
+            pcie_pads_rst_n.eq(pcie_rst_n),
+            pcie_pads.rst_n.eq(pcie_rst_n),
         ]
 
         # PCIe Endpoint (RootPort) -----------------------------------------------------------------
@@ -218,9 +328,10 @@ class LiteNVMeCore(SoCCore):
             address_width        = core_config.get("ep_address_width", 64),
             with_configuration   = True,
         )
+        self.pcie_endpoint.autocsr_exclude = {"phy"}  # PHY CSRs live in the pcie_phy bank.
 
         # Root-port cfg management (raise our own DevCtl.MPS / open memory window).
-        accessor_csr = init_mode == "firmware"
+        accessor_csr = init_mode in ("firmware", "external")
         self.pcie_rootcfg = LiteNVMeRootCfgMgmt(self.pcie_phy, with_csr=accessor_csr)
 
         extra_axi_masters = []
@@ -243,6 +354,11 @@ class LiteNVMeCore(SoCCore):
         # LiteNVMe core ----------------------------------------------------------------------------
         with_request_gen    = core_config.get("with_request_gen", True)
         with_block_streamer = core_config.get("with_block_streamer", False)
+        with_streamer       = core_config.get("with_streamer", False)
+        streamer_ctrl       = core_config.get("streamer_ctrl", "csr")
+        streamer_slot_bytes = core_config.get("streamer_slot_bytes", 0x8000)
+        prp_list_shift      = core_config.get("prp_list_shift",
+            streamer_prp_list_shift(streamer_slot_bytes) if with_streamer else None)
         # When the block streamer is the sole front-end, expose its data/command interface at
         # the top (pin-driven by external logic); otherwise it (if present) is CSR-driven.
         expose_block_pins   = with_block_streamer and not with_request_gen
@@ -269,13 +385,37 @@ class LiteNVMeCore(SoCCore):
             with_engine_csr  = accessor_csr,
             with_request_gen_csr = accessor_csr,
             extra_axi_masters = extra_axi_masters,
+            with_streamer       = with_streamer,
+            streamer_csr        = accessor_csr and streamer_ctrl == "csr",
+            streamer_base       = core_config.get("streamer_base", 0x2000_0000),
+            streamer_nslots     = core_config.get("streamer_nslots", 8),
+            streamer_slot_bytes = streamer_slot_bytes,
+            prp_list_shift      = prp_list_shift,
         )
         if accessor_csr:
             nvme.add_csrs(self)
 
+        # Layout constants for bring-up software (soc.h).
+        self.add_constant("NVME_HOSTMEM_BASE",  hostmem_base)
+        self.add_constant("NVME_HOSTMEM_SIZE",  hostmem_size)
+        self.add_constant("NVME_QID",           core_config.get("qid",   1))
+        self.add_constant("NVME_QSIZE",         core_config.get("qsize", 64))
+        self.add_constant("NVME_QD",            core_config.get("qd",    32))
+        self.add_constant("NVME_PRP_LIST_SHIFT", nvme.io_engine.engine.prp_list_shift)
+        self.add_constant("NVME_BAR0_BASE",     core_config.get("bar0_base", 0xe000_0000))
+        self.add_constant("NVME_DATA_WIDTH",    data_width)
+        for name, off in [("ASQ", HOSTMEM_ASQ_OFFSET), ("ACQ", HOSTMEM_ACQ_OFFSET),
+                          ("ID", HOSTMEM_ID_OFFSET), ("IOCQ", HOSTMEM_IOCQ_OFFSET),
+                          ("IOSQ", HOSTMEM_IOSQ_OFFSET), ("PRP", HOSTMEM_PRP_OFFSET)]:
+            self.add_constant(f"NVME_HOSTMEM_{name}_OFFSET", off)
+        if with_streamer:
+            self.add_constant("NVME_STREAMER_BASE",       nvme.streamer.buf_base)
+            self.add_constant("NVME_STREAMER_NSLOTS",     nvme.streamer.nslots)
+            self.add_constant("NVME_STREAMER_SLOT_BYTES", nvme.streamer.slot_bytes)
+
         # Core control (init_done / init_error) wired to top-level status pins -----------------
         status_pads = platform.request("status")
-        if init_mode == "firmware":
+        if init_mode in ("firmware", "external"):
             self.nvme_ctrl = LiteNVMeCoreControl()
             init_done = self.nvme_ctrl.init_done.storage
             init_error = self.nvme_ctrl.init_error.storage
@@ -348,6 +488,67 @@ class LiteNVMeCore(SoCCore):
                 rd.tdata.eq(bs.rd_source.data),
             ]
 
+# Stream ring interface ---------------------------------------------------------------------------
+        if with_streamer:
+            self.add_stream_ring(platform, nvme.streamer, data_width, init_done, streamer_ctrl,
+                with_pattern = core_config.get("with_stream_pattern", False) and accessor_csr)
+
+    def add_stream_ring(self, platform, st, data_width, init_done, streamer_ctrl, with_pattern):
+        platform.add_extension(get_stream_ios(data_width))
+        wr = platform.request("stream_wr_axis")
+        rd = platform.request("stream_rd_axis")
+
+        # Command: CSR-driven (nvme_streamer_*) or pin-driven; start gated on init_done.
+        if streamer_ctrl == "pins":
+            platform.add_extension(get_stream_ctrl_ios())
+            ctrl = platform.request("stream_ctrl")
+            st_start = Signal()
+            self.comb += [
+                st_start.eq(ctrl.start),
+                st.write.eq(ctrl.write),
+                st.lba.eq(ctrl.lba),
+                st.count.eq(ctrl.count),
+                st.nsid.eq(ctrl.nsid),
+                ctrl.done.eq(st.done),
+                ctrl.busy.eq(st.busy),
+                ctrl.error.eq(st.error),
+            ]
+            self.comb += st.start.eq(st_start)
+        # No transfer can start before bring-up has completed (CSR- or pin-driven start).
+        self.comb += st.start_en.eq(init_done)
+
+        pins_wr = [
+            st.wr_sink.valid.eq(wr.tvalid),
+            wr.tready.eq(st.wr_sink.ready),
+            st.wr_sink.last.eq(wr.tlast),
+            st.wr_sink.data.eq(wr.tdata),
+        ]
+        pins_rd = [
+            rd.tvalid.eq(st.rd_source.valid),
+            st.rd_source.ready.eq(rd.tready),
+            rd.tlast.eq(st.rd_source.last),
+            rd.tdata.eq(st.rd_source.data),
+        ]
+        if not with_pattern:
+            self.comb += pins_wr + pins_rd
+            return
+
+        # Built-in position-encoded pattern generator/checker (prototype self-test), selected
+        # by nvme_stream_mux_sel; the AXI-Stream pins are idle (tready=0/tvalid=0) meanwhile.
+        from litenvme.pattern import LiteNVMeStreamPatternGen, LiteNVMeStreamPatternCheck
+        self.nvme_pattern_gen   = gen = LiteNVMeStreamPatternGen(data_width=data_width)
+        self.nvme_pattern_check = chk = LiteNVMeStreamPatternCheck(data_width=data_width)
+        self.nvme_stream_mux    = mux = LiteNVMeStreamMux()
+        self.comb += [
+            If(mux.pattern,
+                gen.source.connect(st.wr_sink),
+                st.rd_source.connect(chk.sink),
+            ).Else(
+                *pins_wr,
+                *pins_rd,
+            )
+        ]
+
 # Build --------------------------------------------------------------------------------------------
 
 _CONFIG_KEYS = {
@@ -383,6 +584,16 @@ _CONFIG_KEYS = {
     "with_hostmem_csr",
     "staging_base",
     "staging_size",
+    "with_streamer",
+    "streamer_ctrl",
+    "streamer_base",
+    "streamer_nslots",
+    "streamer_slot_bytes",
+    "with_stream_pattern",
+    "prp_list_shift",
+    "pcie_rst_resets_sys",
+    "pcie_perst_delay",
+    "csr_axil_address_width",
 }
 
 def _normalize_config(core_config):
@@ -400,13 +611,19 @@ def _normalize_config(core_config):
     normalized.setdefault("init_mode", "firmware")
     normalized.setdefault("firmware", "none")
     normalized.setdefault("with_block_streamer", False)
-    if normalized["with_block_streamer"] and "with_request_gen" not in normalized:
+    normalized.setdefault("with_streamer", False)
+    if (normalized["with_block_streamer"] or normalized["with_streamer"]) and "with_request_gen" not in normalized:
         normalized["with_request_gen"] = False
     normalized.setdefault("with_request_gen", True)
 
     # CPU-less RTL init is the standalone default for init_mode="rtl". Users can still set a
     # CPU explicitly for debug, but the generated core does not require one.
     if normalized["init_mode"] == "rtl":
+        normalized.setdefault("cpu", None)
+        normalized.setdefault("uart", "stub")
+
+    # External control: no soft-CPU; an external processor runs bring-up over AXI-Lite.
+    if normalized["init_mode"] == "external":
         normalized.setdefault("cpu", None)
         normalized.setdefault("uart", "stub")
 
@@ -422,8 +639,8 @@ def validate_config(core_config):
             raise ValueError(f"Missing required LiteNVMe config key: {key}")
 
     init_mode = core_config.get("init_mode", "firmware")
-    if init_mode not in ("firmware", "rtl"):
-        raise ValueError("init_mode must be 'firmware' or 'rtl'.")
+    if init_mode not in ("firmware", "rtl", "external"):
+        raise ValueError("init_mode must be 'firmware', 'rtl' or 'external'.")
 
     firmware = core_config.get("firmware", "none")
     if firmware not in ("none", "auto", "minimal"):
@@ -432,15 +649,38 @@ def validate_config(core_config):
     if init_mode == "firmware" and core_config.get("cpu", "vexriscv") is None:
         raise ValueError("init_mode='firmware' requires a CPU; use init_mode='rtl' for CPU-less bring-up.")
 
-    if init_mode == "rtl" and firmware != "none":
-        raise ValueError("init_mode='rtl' does not use firmware; set firmware='none'.")
+    if init_mode in ("rtl", "external") and firmware != "none":
+        raise ValueError(f"init_mode='{init_mode}' does not use embedded firmware; set firmware='none'.")
+
+    if init_mode == "external" and core_config.get("cpu", None) is not None:
+        raise ValueError("init_mode='external' has no embedded CPU; remove the cpu key.")
 
     data_width = core_config.get("data_width", 256)
     if data_width not in (64, 128, 256, 512):
         raise ValueError("data_width must be one of: 64, 128, 256, 512.")
 
-    if core_config.get("with_request_gen", False) and core_config.get("with_block_streamer", False):
-        raise ValueError("The standalone generator exposes one front-end; enable request_gen or block_streamer, not both.")
+    front_ends = [k for k in ("with_request_gen", "with_block_streamer", "with_streamer") if core_config.get(k, False)]
+    if len(front_ends) > 1:
+        raise ValueError("The standalone generator exposes one front-end; enable only one of: " + ", ".join(front_ends) + ".")
+
+    if core_config.get("with_streamer", False):
+        if core_config.get("streamer_ctrl", "csr") not in ("csr", "pins"):
+            raise ValueError("streamer_ctrl must be 'csr' or 'pins'.")
+        if init_mode == "rtl" and core_config.get("streamer_ctrl", "csr") == "csr":
+            raise ValueError("init_mode='rtl' has no CSR bus; set streamer_ctrl='pins'.")
+        nslots = core_config.get("streamer_nslots", 8)
+        if core_config.get("qd", 32) < nslots:
+            raise ValueError("qd must be >= streamer_nslots so every slot can be in flight.")
+        slot_bytes = core_config.get("streamer_slot_bytes", 0x8000)
+        shift = core_config.get("prp_list_shift", streamer_prp_list_shift(slot_bytes))
+        if init_mode == "external":
+            prp_end = HOSTMEM_PRP_OFFSET + (core_config.get("qsize", 64) << shift)
+            if prp_end > core_config.get("hostmem_size", 0x8_0000):
+                raise ValueError(f"hostmem_size too small for the queue/PRP layout (needs 0x{prp_end:x}).")
+            if core_config.get("qsize", 64) * 64 > HOSTMEM_PRP_OFFSET - HOSTMEM_IOSQ_OFFSET:
+                raise ValueError("qsize too large for the fixed IO SQ region (max 64).")
+    if core_config.get("with_stream_pattern", False) and init_mode == "rtl":
+        raise ValueError("with_stream_pattern needs the CSR bus (init_mode 'firmware' or 'external').")
 
 def load_config(filename):
     with open(filename, "r", encoding="utf-8") as f:
