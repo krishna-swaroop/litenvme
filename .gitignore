@@ -24,3 +24,6 @@ bench/firmware/firmware.elf.map
 
 # LiteScope generated analyzer description.
 bench/analyzer.csv
+
+# Host tool binary.
+software/litenvme/litenvme_test
