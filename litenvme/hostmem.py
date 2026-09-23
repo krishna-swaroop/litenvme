@@ -361,6 +361,8 @@ class LiteNVMeHostMemDMA(LiteXModule):
       - Only full-beat writes are accepted when BE is present.
       - Only one MemRd can be in-flight (completions are serialized).
       - Read path uses a small FIFO to tolerate completion backpressure.
+      - A MemRd at a non beat-aligned address is realigned: the completion payload starts with
+        the requested dword (CplD data is dword-aligned) and spans ceil(len/beat) beats.
     """
     def __init__(self, port, data_width, base, size, beat_bytes_shift, beat_dwords, beat_dwords_shift):
         self.port = port
@@ -494,6 +496,20 @@ class LiteNVMeHostMemDMA(LiteXModule):
             total_beats_now.eq(beats_from_len_dw(req.len) if has_len else 1),
         ]
 
+        # Read realignment state: dword offset of the request inside its first beat, and the
+        # number of backend beats to read to cover [offset, offset + len).
+        rd_off     = Signal(max=(beat_dwords if beat_dwords > 1 else 2))
+        rd_prev    = Signal(data_width)
+        rd_have    = Signal()   # rd_prev holds a beat not yet fully emitted.
+        rd_flush   = Signal()   # all backend beats received; emit the final beat from rd_prev.
+        rd_outcnt  = Signal(16)
+        mem_beats_now = Signal(16)
+        req_off_dw    = Signal(max=(beat_dwords if beat_dwords > 1 else 2))
+        self.comb += [
+            req_off_dw.eq(((req.adr - base) >> 2) & (beat_dwords - 1)),
+            mem_beats_now.eq(beats_from_len_dw(req_off_dw + (req.len if has_len else 1))),
+        ]
+
         # AXI write engine.
         # Stream AW+W for each beat: AW and W are independent channels, so deassert each once
         # accepted (aw_done/w_done), advance to the next beat when BOTH are accepted, and drain
@@ -622,7 +638,11 @@ class LiteNVMeHostMemDMA(LiteXModule):
                         )
                     ).Else(
                         NextValue(cur_word,  first_word),
-                        NextValue(beats_left, total_beats_now),
+                        NextValue(beats_left, mem_beats_now),
+                        NextValue(rd_off,    req_off_dw),
+                        NextValue(rd_have,   0),
+                        NextValue(rd_flush,  0),
+                        NextValue(rd_outcnt, 0),
                         NextState("RD_STREAM"),
                     )
                 )
@@ -679,14 +699,75 @@ class LiteNVMeHostMemDMA(LiteXModule):
         ]
 
         # AXI read responses to completion FIFO.
-        r_fire = Signal()
+        #  - Beat-aligned request: pass-through.
+        #  - Otherwise: output beat k = dwords [off + k*B, off + (k+1)*B) of the backend stream,
+        #    built from the previous and current backend beats (constant-shift Case, see the
+        #    sub-beat write note), plus a final flush from the last backend beat when needed.
+        r_fire    = Signal()
+        r_avail   = Signal()
+        mem_last  = Signal()
+        combined  = Signal(data_width)
+        flushed   = Signal(data_width)
+        out_last  = Signal()
         self.comb += [
-            self.axi.r.ready.eq(rd_fifo.sink.ready & rd_last_fifo.source.valid),
-            rd_fifo.sink.valid.eq(self.axi.r.valid & rd_last_fifo.source.valid),
-            rd_fifo.sink.dat.eq(self.axi.r.data),
-            rd_fifo.sink.last.eq(rd_last_fifo.source.flag),
+            r_avail.eq(self.axi.r.valid & rd_last_fifo.source.valid),
+            mem_last.eq(rd_last_fifo.source.flag),
+            out_last.eq(rd_outcnt == (beats_total - 1)),
             r_fire.eq(self.axi.r.valid & self.axi.r.ready),
             rd_last_fifo.source.ready.eq(r_fire),
+        ]
+        if beat_dwords > 1:
+            self.comb += Case(rd_off, {
+                o: [
+                    combined.eq(Cat(rd_prev[32*o:], self.axi.r.data[:32*o])),
+                    flushed.eq(rd_prev[32*o:]),
+                ] for o in range(1, beat_dwords)
+            })
+        self.comb += [
+            If(rd_off == 0,
+                self.axi.r.ready.eq(rd_fifo.sink.ready & rd_last_fifo.source.valid),
+                rd_fifo.sink.valid.eq(r_avail),
+                rd_fifo.sink.dat.eq(self.axi.r.data),
+                rd_fifo.sink.last.eq(mem_last),
+            ).Elif(rd_flush,
+                rd_fifo.sink.valid.eq(1),
+                rd_fifo.sink.dat.eq(flushed),
+                rd_fifo.sink.last.eq(1),
+            ).Elif(~rd_have,
+                # First backend beat: only captured.
+                self.axi.r.ready.eq(rd_last_fifo.source.valid),
+            ).Else(
+                self.axi.r.ready.eq(rd_fifo.sink.ready & rd_last_fifo.source.valid),
+                rd_fifo.sink.valid.eq(r_avail),
+                rd_fifo.sink.dat.eq(combined),
+                rd_fifo.sink.last.eq(out_last),
+            )
+        ]
+        self.sync += [
+            If(rd_off != 0,
+                If(rd_flush,
+                    If(rd_fifo.sink.ready,
+                        rd_flush.eq(0),
+                        rd_have.eq(0),
+                    )
+                ).Elif(r_fire,
+                    rd_prev.eq(self.axi.r.data),
+                    If(~rd_have,
+                        rd_have.eq(1),
+                        # Single backend beat: its (only) output comes from the flush.
+                        If(mem_last, rd_flush.eq(1)),
+                    ).Else(
+                        rd_outcnt.eq(rd_outcnt + 1),
+                        If(mem_last,
+                            If(out_last,
+                                rd_have.eq(0),
+                            ).Else(
+                                rd_flush.eq(1),
+                            )
+                        )
+                    )
+                )
+            )
         ]
 
         fsm.act("RD_STREAM",
@@ -694,6 +775,7 @@ class LiteNVMeHostMemDMA(LiteXModule):
                (beats_sent  == beats_total) &
                (beats_left  == 0) &
                (rd_outstanding == 0) &
+               ~rd_have & ~rd_flush &
                (~rd_fifo.source.valid),
                 NextState("IDLE"),
             )
