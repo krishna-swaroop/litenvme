@@ -60,6 +60,16 @@ the reverse). The two regions must not overlap.
 `streamer_backend` accepts an external backend with a matching `.axi` slave, as
 `hostmem_backend` does.
 
+### Standalone core (litenvme_gen)
+
+`with_streamer: True` exposes the stream ring in the generated core (`stream_wr_axis` /
+`stream_rd_axis` data pins; commands via CSRs, or pins with `streamer_ctrl: "pins"`).
+`with_stream_pattern: True` adds the pattern generator/checker, selected by
+`nvme_stream_mux_sel`. Pair it with `init_mode: "external"`: the core has no soft-CPU and
+exposes its CSR bus as an AXI-Lite slave (`csr_axil_*`, 64 KiB aperture, CSRs at offset 0), so
+a Zynq PS or MicroBlaze runs bring-up with `software/litenvme` while the PL moves the data.
+`examples/zu17eg_ssd0.yml` is a complete example. Transfers only start once `init_done` is set.
+
 Geometry rules (asserted at elaboration):
 
 - `slot_bytes` is a multiple of the LBA size.
@@ -107,4 +117,5 @@ Performance (simulation, 256-bit, 1 KiB slots, sequential SSD model):
 - Engine SQE build is dword-granular. Writing the SQE as full beats would lower the
   per-command floor.
 - The responder serves one SSD MemRd at a time. Pipelining it would raise write throughput.
-- The generator (`litenvme_gen`) does not expose the streamer yet.
+- The generated core's stream data pins are in the core clock domain. Add an async FIFO to
+  cross from a source's own clock.
