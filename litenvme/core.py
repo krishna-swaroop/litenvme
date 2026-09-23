@@ -93,6 +93,7 @@ class LiteNVMe(LiteXModule):
                  staging_base=0x4_0000, staging_size=0x4_0000, with_csr=True,
                  with_streamer=False, streamer_csr=True, streamer_base=0x2000_0000,
                  streamer_nslots=8, streamer_slot_bytes=0x8000, streamer_backend=None,
+                 prp_list_shift=None,
                  with_accessor_csr=None, with_engine_csr=None, with_request_gen_csr=None,
                  extra_axi_masters=None):
         # hostmem_backend: optional pre-built host-memory backend exposing a matching
@@ -150,7 +151,7 @@ class LiteNVMe(LiteXModule):
         # Hardware I/O command engine (engine + dword->AXI bridge).
         self.io_engine = io_engine = LiteNVMeIOEngineAXI(
             qid=qid, qsize=qsize, qd=qd, data_width=data_width, with_csr=with_engine_csr,
-            hostmem_base=hostmem_base)
+            hostmem_base=hostmem_base, prp_list_shift=prp_list_shift)
 
         # Engine front-ends share one AXI backend; build them before the responder so their
         # masters join the arbiter. Front-ends (request_gen, block streamer, external logic)

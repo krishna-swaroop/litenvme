@@ -143,15 +143,24 @@ class LiteNVMeIOEngine(LiteXModule):
     admin/setup code chose.
     """
     def __init__(self, qid=1, qsize=64, qd=None, mem_adr_width=32, with_csr=True,
-                 lba_shift=9, page_shift=12):
+                 lba_shift=9, page_shift=12, prp_list_shift=None):
         if qd is None:
             qd = qsize - 1
+        if prp_list_shift is None:
+            prp_list_shift = page_shift
         assert qd <= qsize - 1, "qd must be <= qsize-1 (one slot reserved to disambiguate full/empty)"
+        # A PRP list must not cross a page boundary (it would then need chaining), so per-slot
+        # list strides must divide the page.
+        assert 3 <= prp_list_shift <= page_shift
         self.qid        = qid
         self.qsize      = qsize
         self.qd         = qd
         self.lba_shift  = lba_shift    # log2(LBA size in bytes), default 512 B.
         self.page_shift = page_shift   # log2(MPS, NVMe memory page size), default 4 KiB.
+        # log2(per-SQ-slot PRP-list stride). Default: one page per slot. A smaller stride packs
+        # the lists (a slot's list holds up to 2**prp_list_shift / 8 entries, i.e. transfers of
+        # up to that many + 1 pages), saving host memory for bounded transfer sizes.
+        self.prp_list_shift = prp_list_shift
 
         # Streams.
         self.sink   = stream.Endpoint(request_layout())
@@ -174,7 +183,7 @@ class LiteNVMeIOEngine(LiteXModule):
         self.cq_base     = Signal(64)   # IO CQ base (host-memory byte address).
         self.sq_db_adr   = Signal(64)   # SQ doorbell (BAR0 byte address).
         self.cq_db_adr   = Signal(64)   # CQ doorbell (BAR0 byte address).
-        # PRP-list region (host byte address): one page-aligned list page per SQ slot,
+        # PRP-list region (host byte address): one list per SQ slot (stride 2**prp_list_shift),
         # used when a transfer spans >2 pages. Each list page holds up to (page/8)
         # 64-bit page-address entries. Only consulted for such transfers.
         self.prp_list_base = Signal(64)
@@ -236,7 +245,7 @@ class LiteNVMeIOEngine(LiteXModule):
         self.comb += [
             s_nbytes.eq(self.sink.nlb << lba_shift),
             s_npages.eq((s_nbytes + (page_bytes - 1)) >> page_shift),
-            s_list_slot.eq(self.prp_list_base + (sq_tail << page_shift)),
+            s_list_slot.eq(self.prp_list_base + (sq_tail << prp_list_shift)),
         ]
         s_prp2      = Signal(64)
         s_need_list = Signal()
@@ -344,8 +353,20 @@ class LiteNVMeIOEngine(LiteXModule):
         #   2. once we can't submit more, flush the accumulated SQ doorbell ONCE;
         #   3. reap any ready completions (the reap path loops, draining a whole batch);
         #   4. flush the accumulated CQ doorbell ONCE.
+        # While disabled (and idle), hold the ring state at its post-queue-creation values so
+        # re-running bring-up (which recreates the IO SQ/CQ at index 0) starts from a clean ring.
+        ring_reset = [
+            NextValue(sq_tail,       0),
+            NextValue(cq_head,       0),
+            NextValue(cq_phase,      1),
+            NextValue(sq_db_rung,    0),
+            NextValue(cq_db_rung,    0),
+            NextValue(self.inflight, 0),
+        ] + [NextValue(slot_busy[i], 0) for i in range(qsize)]
         fsm.act("IDLE",
-            If(can_submit,
+            If(~self.enable,
+                *ring_reset,
+            ).Elif(can_submit,
                 NextState("LATCH-REQ"),
             ).Elif(sq_tail != sq_db_rung,
                 NextState("SUBMIT-DOORBELL"),
@@ -741,11 +762,12 @@ class LiteNVMeIOEngineAXI(LiteXModule):
     doorbell port, config and status signals are re-exported.
     """
     def __init__(self, qid=1, qsize=64, qd=None, data_width=128, with_csr=True,
-                 hostmem_base=0x0000_0000):
+                 hostmem_base=0x0000_0000, prp_list_shift=None):
         # hostmem_base MUST equal the responder's window base so the bridge de-bases the
         # engine's full host addresses to the flat backend (see LiteNVMeMemPortToAXI).
         self.submodules.engine = engine = LiteNVMeIOEngine(
-            qid=qid, qsize=qsize, qd=qd, mem_adr_width=32, with_csr=with_csr)
+            qid=qid, qsize=qsize, qd=qd, mem_adr_width=32, with_csr=with_csr,
+            prp_list_shift=prp_list_shift)
         self.submodules.bridge = bridge = LiteNVMeMemPortToAXI(
             engine.mem, data_width=data_width, address_width=32, base=hostmem_base)
 
