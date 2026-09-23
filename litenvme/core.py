@@ -108,6 +108,8 @@ class LiteNVMe(LiteXModule):
         # drive `self.request`/`self.completion` from your own logic.
         self.pcie_endpoint = pcie_endpoint
         endpoint = pcie_endpoint
+        # The endpoint (and its PHY) belong to the SoC: don't re-export their CSRs under ours.
+        self.autocsr_exclude = {"pcie_endpoint"}
 
         if data_width is None:
             data_width = endpoint.phy.data_width
@@ -248,7 +250,15 @@ class LiteNVMe(LiteXModule):
         Convenience for SoC integration. Call after instantiating the core, e.g.:
             self.nvme = LiteNVMe(self.pcie_endpoint, ...)
             self.nvme.add_csrs(self)
+
+        The registered sub-blocks are then excluded from the core's own CSR gathering, so each
+        CSR lives in exactly one bank (LiteX gathers CSRs from every reachable attribute; a
+        CSR reachable through two banks gets two bus decoders driving the same strobes).
         """
+        self.autocsr_exclude = set(self.autocsr_exclude) | {
+            "cfg", "mmio", "mmio_db", "io_engine", "hostmem", "request_gen", "block_streamer",
+            "streamer", "streamer_mem",
+        }
         if self.with_accessor_csr:
             soc.add_module(name=f"{name}_cfg",    module=self.cfg)
             soc.add_module(name=f"{name}_mmio",   module=self.mmio)
