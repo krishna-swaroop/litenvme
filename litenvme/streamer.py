@@ -251,8 +251,9 @@ class LiteNVMeStreamer(LiteXModule):
         self.rd_source = stream.Endpoint([("data", data_width)])
 
         # Control / status.
-        self.start = Signal()
-        self.write = Signal()
+        self.start    = Signal()
+        self.start_en = Signal(reset=1)  # qualifies `start` (e.g. tie to the core's init_done).
+        self.write    = Signal()
         self.lba   = Signal(64)
         self.count = Signal(32)
         self.nsid  = Signal(32, reset=1)
@@ -443,7 +444,7 @@ class LiteNVMeStreamer(LiteXModule):
         ]
 
         fsm.act("IDLE",
-            If(self.start,
+            If(self.start & self.start_en,
                 clear_slots.eq(1),
                 NextValue(w_write, self.write),
                 NextValue(w_nsid,  self.nsid),
