@@ -539,6 +539,7 @@ class LiteNVMeCore(SoCCore):
         self.nvme_pattern_gen   = gen = LiteNVMeStreamPatternGen(data_width=data_width)
         self.nvme_pattern_check = chk = LiteNVMeStreamPatternCheck(data_width=data_width)
         self.nvme_stream_mux    = mux = LiteNVMeStreamMux()
+        retired_busy = Signal()
         self.comb += [
             If(mux.pattern,
                 gen.source.connect(st.wr_sink),
@@ -548,6 +549,10 @@ class LiteNVMeCore(SoCCore):
                 *pins_rd,
             )
         ]
+        # A failed read can retire after a valid prefix. Abort only on that
+        # transfer's busy falling edge so sticky error cannot cancel a later check.
+        self.sync += retired_busy.eq(st.busy)
+        self.comb += chk.abort.eq(retired_busy & ~st.busy & st.error & mux.pattern)
 
 # Build --------------------------------------------------------------------------------------------
 

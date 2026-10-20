@@ -29,16 +29,23 @@ write:  wr_sink ──fill──▶ slot[k] ──WRITE cmd──▶ SSD reads s
 read :  READ cmd for every FREE slot ──▶ SSD writes slot[k] ──CQE──▶ READY ──drain──▶ rd_source
 ```
 
-- Slot states: `FREE → BUSY → FREE` (write), `FREE → BUSY → READY → FREE` (read).
+- Slot states: `FREE → BUSY → FREE` (write), `FREE → BUSY → READY → FREE` (successful
+  read), or `FREE → BUSY → FAILED → FREE` (failed read after queued commands retire).
 - A write command is queued only after every AXI write response for its slot has been
   received (payload committed). A slot is never refilled or resubmitted while BUSY.
-- Read data is exposed only after its completion; slots drain strictly in LBA order.
+- Read data is exposed only after a successful completion; slots drain strictly in LBA order.
 - Completions are matched to slots with the engine request/completion `tag` field (the slot
   index), so the device may complete commands in any order.
 - The final chunk may be shorter than a slot. `rd_source.last` marks the final beat.
-- A completion with non-success status sets `error`, increments `err_count` and records the
-  first status. The transfer still runs to completion and frees every slot. A completion
-  whose tag does not match a BUSY slot is counted in `stale_count` and also sets `error`.
+- A completion with non-success SC or SCT sets `error`, increments `err_count` and records the
+  first status. On a failed read, the streamer stops queuing new reads, drains successful slots
+  before the first failed slot, and never exposes the failed slot or any later slot. Commands
+  already queued to the engine are allowed to complete; then the streamer frees every slot and
+  asserts `done`. Unissued sectors are abandoned. A failed read emits no synthetic success
+  `last`, so downstream logic must check `error` at completion and must not assume that the
+  requested count was delivered. `data_beats` reports the actual accepted prefix length.
+  A completion whose tag does not match a BUSY slot is counted in `stale_count` and also sets
+  `error`.
 
 ## Integration
 
@@ -111,7 +118,10 @@ Performance (simulation, 256-bit, 1 KiB slots, sequential SSD model):
 
 - No command timeout: a missing completion stalls the transfer. Recovery and abort are not
   implemented.
-- A failed read chunk is still drained (flagged by `error`).
+- `LiteNVMeCore` pulses `LiteNVMeStreamPatternCheck.abort` once when an errored streamer
+  transfer retires, so a later pattern operation can start. Standalone checker integrations
+  must pulse `abort` when a read ends with a truncated prefix; the checker retains its partial
+  beat count and reports the truncation through `last_error`.
 - The backend is on-FPGA RAM. A DDR-backed ring needs burst AXI in the streamer DMA and
   responder.
 - Engine SQE build is dword-granular. Writing the SQE as full beats would lower the

@@ -40,6 +40,7 @@ class _PatternCounter(LiteXModule):
         self.lba    = Signal(64)
         self.count  = Signal(32)
         self.seed   = Signal(32)
+        self.abort  = Signal(reset=0)  # Abort a truncated transfer while preserving checker statistics.
         self.busy   = Signal()
         self.done   = Signal()
 
@@ -57,7 +58,10 @@ class _PatternCounter(LiteXModule):
             self.done.eq(done_r),
         ]
         self.sync += [
-            If(self.start & ~self.busy,
+            If(self.abort,
+                self.beats_left.eq(0),
+                done_r.eq(1),
+            ).Elif(self.start & ~self.busy,
                 self.dw_idx.eq(self.lba * lba_dwords),
                 self.beats_left.eq(self.count << beats_per_lba_shift),
                 self.seed_r.eq(self.seed),
@@ -123,24 +127,28 @@ class LiteNVMeStreamPatternCheck(LiteXModule):
         self.beats      = Signal(32)  # Beats checked.
         self.errors     = Signal(32)  # Mismatching beats.
         self.first_err  = Signal(32)  # Beat index of the first mismatch.
-        self.last_error = Signal()    # `last` seen before the final beat, or missing on it.
+        self.last_error = Signal()    # Bad `last`, or a checker aborted on a truncated prefix.
 
         # # #
 
         self.ctrl = ctrl = _PatternCounter(data_width, lba_bytes, with_csr)
         self.start, self.lba, self.count, self.seed = ctrl.start, ctrl.lba, ctrl.count, ctrl.seed
         self.busy,  self.done = ctrl.busy, ctrl.done
+        self.abort = ctrl.abort
 
         expected = Signal(data_width)
         fire     = Signal()
         self.comb += [
-            self.sink.ready.eq(ctrl.busy),
+            self.sink.ready.eq(ctrl.busy & ~ctrl.abort),
             expected.eq(_pattern_beat(ctrl.dw_idx, ctrl.seed_r, data_width // 32)),
             fire.eq(self.sink.valid & self.sink.ready),
             ctrl.advance.eq(fire),
         ]
         self.sync += [
-            If(ctrl.start & ~ctrl.busy,
+            # A failed stream read can end after a valid prefix; retain its measurements.
+            If(ctrl.abort,
+                self.last_error.eq(1),
+            ).Elif(ctrl.start & ~ctrl.busy,
                 self.beats.eq(0),
                 self.errors.eq(0),
                 self.first_err.eq(0),
