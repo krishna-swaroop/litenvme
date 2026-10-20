@@ -707,7 +707,7 @@ class LiteNVMeMemPortToAXI(LiteXModule):
             self.axi.aw.valid.eq(~aw_done),
             self.axi.aw.addr.eq(byte_adr),
             self.axi.aw.len.eq(0),
-            self.axi.aw.size.eq(axi.AXSIZE[beat_bytes]),
+            self.axi.aw.size.eq(log2_int(beat_bytes)),
             self.axi.aw.burst.eq(axi.BURST_INCR),
             self.axi.aw.id.eq(0),
 
@@ -734,7 +734,7 @@ class LiteNVMeMemPortToAXI(LiteXModule):
             self.axi.ar.valid.eq(1),
             self.axi.ar.addr.eq(byte_adr),
             self.axi.ar.len.eq(0),
-            self.axi.ar.size.eq(axi.AXSIZE[beat_bytes]),
+            self.axi.ar.size.eq(log2_int(beat_bytes)),
             self.axi.ar.burst.eq(axi.BURST_INCR),
             self.axi.ar.id.eq(0),
             If(self.axi.ar.ready,

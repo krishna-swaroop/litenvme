@@ -94,7 +94,7 @@ class LiteNVMeStreamDMA(LiteXModule):
         # # #
 
         beat_bytes = data_width // 8
-        axsize     = axi.AXSIZE[beat_bytes]
+        axsize     = log2_int(beat_bytes)
 
         adr        = Signal(address_width)  # Next AW/AR address.
         issue_left = Signal(32)             # Beats still to issue (AW+W or AR).

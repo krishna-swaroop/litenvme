@@ -291,7 +291,7 @@ class LiteNVMeHostMemCSR(LiteXModule):
             self.axi.aw.valid.eq(~aw_sent),
             self.axi.aw.addr.eq(csr_addr_latched << beat_bytes_shift),
             self.axi.aw.len.eq(0),
-            self.axi.aw.size.eq(axi.AXSIZE[beat_bytes]),
+            self.axi.aw.size.eq(log2_int(beat_bytes)),
             self.axi.aw.burst.eq(axi.BURST_INCR),
             self.axi.aw.id.eq(0),
 
@@ -425,7 +425,7 @@ class LiteNVMeHostMemDMA(LiteXModule):
         beats_sent  = Signal(16)
 
         beat_bytes = data_width // 8
-        axi_size   = axi.AXSIZE[beat_bytes]
+        axi_size   = log2_int(beat_bytes)
 
         # Read FIFO: (dat,last) to drive last/end reliably under backpressure.
         self.submodules.rd_fifo = rd_fifo = stream.SyncFIFO(
