@@ -1,75 +1,87 @@
 name: ci
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [main, 'feature/stream-ring']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 115
+    env:
+      PYTHONUNBUFFERED: '1'
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
+      PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/test
     steps:
-      # Checkout Repository
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
 
-      # Install Tools
-      - name: Install Tools
+      - name: Install C toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget build-essential
+          sudo apt-get install -y build-essential
 
-      - name: Set up Python 3.9
-        uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
-          python-version: "3.9"
-          cache: "pip"
-          cache-dependency-path: "setup.py"
+          python-version: '3.12'
 
-      - name: Install Python dependencies
+      - name: Install immutable dependencies and current source
+        timeout-minutes: 10
         run: |
-          python3 -m pip install --upgrade pip setuptools wheel
-          python3 -m pip install requests pexpect meson pytest
+          python -m venv "$RUNNER_TEMP/litenvme-ci"
+          CI_TOOL_PYTHON="$RUNNER_TEMP/litenvme-ci/bin/python"
+          printf 'CI_PYTHON=%s\n' "$CI_TOOL_PYTHON" >> "$GITHUB_ENV"
+          "$CI_TOOL_PYTHON" -m pip install -r .github/requirements-ci.lock
+          "$CI_TOOL_PYTHON" -m pip install --no-deps --no-build-isolation -e .
 
-      # Install LiteX Ecosystem
-      - name: Install LiteX
+      - name: Record and verify dependency provenance
         run: |
-          wget https://raw.githubusercontent.com/enjoy-digital/litex/master/litex_setup.py
-          python3 litex_setup.py --clone-depth=1 init install --user
+          mkdir -p build/ci
+          "$CI_PYTHON" -m pip freeze > build/ci/pip-freeze.txt
+          git rev-parse HEAD > build/ci/commit.txt
+          cc --version > build/ci/cc-version.txt
+          "$CI_PYTHON" .github/scripts/check_ci_provenance.py
 
-      # Install Project
-      - name: Install Project
-        run: python3 -m pip install -e ".[develop]"
+      - name: Verify CI watchdog and result validation
+        timeout-minutes: 2
+        run: '"$CI_PYTHON" -m unittest discover -s .github/scripts -p test_run_ci_tests.py -v'
 
-      # Smoke Tests
-      - name: Package Discovery
+      - name: Package and generator smoke checks
+        timeout-minutes: 5
         run: |
-          python3 -c 'from setuptools import find_packages; assert "litenvme" in find_packages(exclude=("test*", "sim*", "doc*", "examples*"))'
-
-      - name: Import Smoke Test
-        run: |
-          python3 -c 'import litenvme.core, litenvme.mem, litenvme.cfg, litenvme.gen'
-
-      - name: Generator Config Check
-        run: |
-          python3 -c 'from litenvme.gen import load_config; assert load_config("examples/alibaba_xcku3p.yml")["init_mode"] == "firmware"'
-
-      - name: Generator Dry Run
-        run: |
-          python3 - <<'PY'
+          "$CI_PYTHON" -c 'from setuptools import find_packages; assert "litenvme" in find_packages(exclude=("test*", "sim*", "doc*", "examples*"))'
+          "$CI_PYTHON" -c 'import litenvme.core, litenvme.mem, litenvme.cfg, litenvme.gen'
+          "$CI_PYTHON" -c 'from litenvme.gen import load_config; assert load_config("examples/alibaba_xcku3p.yml")["init_mode"] == "firmware"'
+          "$CI_PYTHON" - <<'PY'
           from pathlib import Path
           import yaml
           from litenvme.gen import load_config
-
           cfg = load_config("examples/alibaba_xcku3p.yml")
-          cfg["init_mode"] = "rtl"
-          cfg["cpu"] = None
-          cfg["uart"] = "stub"
-          cfg["firmware"] = "none"
-          Path("/tmp/litenvme_gen_ci.yml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
+          cfg.update(init_mode="rtl", cpu=None, uart="stub", firmware="none")
+          Path("build/ci/generator.yml").write_text(yaml.safe_dump(cfg))
           PY
-          python3 -m litenvme.gen /tmp/litenvme_gen_ci.yml --output-dir /tmp/litenvme_gen --name litenvme_core
+          "$CI_PYTHON" -m litenvme.gen build/ci/generator.yml --output-dir build/ci/generated --name litenvme_core > build/ci/generator.log 2>&1
 
-      - name: Collect Tests
-        run: python3 -m pytest --collect-only -q
+      - name: Run all tests with bounded execution and retained progress
+        timeout-minutes: 92
+        run: '"$CI_PYTHON" .github/scripts/run_ci_tests.py'
 
-      # Test
-      - name: Run Tests
-        run: python3 -m pytest -q test
+      - name: Retain CI evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: litenvme-ci-evidence
+          path: build/ci/
+          retention-days: 14
