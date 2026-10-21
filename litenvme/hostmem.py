@@ -418,6 +418,10 @@ class LiteNVMeHostMemDMA(LiteXModule):
         lat_len_dw = Signal(10)
         lat_req_id = Signal(16)
         lat_lower  = Signal(7)
+        rd_error   = Signal()  # Any non-OKAY AXI response poisons the whole PCIe completion.
+        rd_release = Signal()  # Do not publish a CplD until all DDR data is assembled.
+        rd_error_cpl_valid = Signal()  # One header-only error beat after buffered data is drained.
+        rd_fifo_pop = Signal()
 
         cur_word    = Signal(32)
         beats_total = Signal(16)
@@ -430,7 +434,9 @@ class LiteNVMeHostMemDMA(LiteXModule):
         # Read FIFO: (dat,last) to drive last/end reliably under backpressure.
         self.submodules.rd_fifo = rd_fifo = stream.SyncFIFO(
             [("dat", data_width)],
-            depth    = 64,
+            # Hold the largest possible PCIe read (len is 10-bit, zero is unsupported) until
+            # every AXI response has arrived. The completion has ceil(len/beat_dwords) beats.
+            depth    = (1023 + beat_dwords - 1) // beat_dwords,
             buffered = False,
         )
 
@@ -450,14 +456,17 @@ class LiteNVMeHostMemDMA(LiteXModule):
 
         # Completions driven from FIFO.
         self.comb += [
-            cmp.valid.eq(rd_fifo.source.valid),
-            cmp_dat.eq(rd_fifo.source.dat),
-            rd_fifo.source.ready.eq(cmp.ready),
+            # Healthy reads stream the buffered completion. A failed read drains that data
+            # internally, then emits one header-only error beat for LitePCIe's UR packetizer.
+            cmp.valid.eq((~rd_error & rd_release & rd_fifo.source.valid) | rd_error_cpl_valid),
+            rd_fifo.source.ready.eq(rd_fifo_pop),
+            # An AXI read error poisons the whole packet, including earlier successful beats.
+            cmp_dat.eq(Mux(rd_error, 0, rd_fifo.source.dat)),
         ]
 
         # Completion metadata.
         if hasattr(cmp, "len"):
-            self.comb += cmp.len.eq(lat_len_dw)
+            self.comb += cmp.len.eq(Mux(rd_error, 0, lat_len_dw))
         if has_tag:
             self.comb += cmp.tag.eq(lat_tag)
         if has_reqid and hasattr(cmp, "req_id"):
@@ -465,25 +474,25 @@ class LiteNVMeHostMemDMA(LiteXModule):
         if has_cmpid:
             self.comb += cmp.cmp_id.eq(0)
         if hasattr(cmp, "err"):
-            self.comb += cmp.err.eq(0)
+            self.comb += cmp.err.eq(rd_error)
         # Raw-TLP PHYs (7-series shared channel) take the CplD header's Byte Count and
         # Lower Address fields directly from the port, unlike the USP CC adapter which
         # derives them in the hard IP. Byte Count = total bytes of this (single, complete)
         # completion; 0 would mean 4096 remaining and stall the requester's read forever.
         if hasattr(cmp, "byte_count"):
-            self.comb += cmp.byte_count.eq(lat_len_dw << 2)
+            self.comb += cmp.byte_count.eq(Mux(rd_error, 0, lat_len_dw << 2))
         if hasattr(cmp, "adr"):
-            self.comb += cmp.adr.eq(lat_lower)
+            self.comb += cmp.adr.eq(Mux(rd_error, 0, lat_lower))
 
         pop = Signal()
         self.comb += pop.eq(cmp.valid & cmp.ready)
 
         if hasattr(cmp, "first"):
-            self.comb += cmp.first.eq(beats_sent == 0)
+            self.comb += cmp.first.eq(Mux(rd_error, 1, beats_sent == 0))
         if hasattr(cmp, "last"):
-            self.comb += cmp.last.eq(rd_fifo.source.last)
+            self.comb += cmp.last.eq(Mux(rd_error, 1, rd_fifo.source.last))
         if has_end:
-            self.comb += cmp.end.eq(rd_fifo.source.last)
+            self.comb += cmp.end.eq(Mux(rd_error, 1, rd_fifo.source.last))
 
         def beats_from_len_dw(len_dw):
             # ceil(len_dw / beat_dwords)
@@ -551,10 +560,12 @@ class LiteNVMeHostMemDMA(LiteXModule):
 
         # FSM.
         self.fsm = fsm = FSM(reset_state="IDLE")
+        read_accept = Signal()
+        self.comb += read_accept.eq(fsm.ongoing("IDLE") & req.valid & req.ready &
+                                    ~req.we & in_window & full_be_ok)
 
-        # Write push helpers.
-        wr_word_adr = Signal(32)
-        self.comb += wr_word_adr.eq(Mux(fsm.ongoing("WR_STREAM"), cur_word, first_word))
+        # Write push helpers. State-local addresses/ready expressions below avoid
+        # feeding combinational FSM outputs back into the same generated process.
         wr_strb = Signal(beat_bytes)
         if has_be:
             self.comb += wr_strb.eq(req.be)
@@ -615,7 +626,7 @@ class LiteNVMeHostMemDMA(LiteXModule):
 
         fsm.act("IDLE",
             req.ready.eq(Mux(req.we, wr_fifo.sink.ready, 1)),
-            If(req.valid & req.ready,
+            If(req.valid & Mux(req.we, wr_fifo.sink.ready, 1),
                 If(~in_window | ~full_be_ok,
                     NextState("DROP"),
                 ).Else(
@@ -651,16 +662,16 @@ class LiteNVMeHostMemDMA(LiteXModule):
 
         fsm.act("DROP",
             req.ready.eq(1),
-            If(req.valid & req.ready & getattr(req, "last", 1),
+            If(req.valid & getattr(req, "last", 1),
                 NextState("IDLE"),
             )
         )
 
         fsm.act("WR_STREAM",
             req.ready.eq((beats_left != 0) & wr_fifo.sink.ready),
-            If(req.valid & req.ready,
+            If(req.valid & (beats_left != 0) & wr_fifo.sink.ready,
                 wr_fifo.sink.valid.eq(1),
-                wr_fifo.sink.addr.eq(wr_word_adr << beat_bytes_shift),
+                wr_fifo.sink.addr.eq(cur_word << beat_bytes_shift),
                 wr_fifo.sink.data.eq(req_dat),
                 wr_fifo.sink.strb.eq(wr_strb),
 
@@ -680,6 +691,14 @@ class LiteNVMeHostMemDMA(LiteXModule):
         rd_issue_last = Signal()
         self.comb += rd_issue.eq(fsm.ongoing("RD_STREAM") & (beats_left != 0) & rd_last_fifo.sink.ready)
         self.comb += rd_issue_last.eq(beats_left == 1)
+        # A completion may not escape until all requested AXI responses are retired and
+        # unaligned data realignment (including its final flush) is complete.
+        self.comb += [
+            rd_release.eq((beats_left == 0) & (rd_outstanding == 0) & ~rd_have & ~rd_flush),
+            rd_fifo_pop.eq(rd_release & (rd_error | cmp.ready)),
+            rd_error_cpl_valid.eq(rd_release & rd_error &
+                                  ~rd_fifo.source.valid),
+        ]
 
         self.comb += [
             self.axi.ar.valid.eq(rd_issue),
@@ -771,7 +790,12 @@ class LiteNVMeHostMemDMA(LiteXModule):
         ]
 
         fsm.act("RD_STREAM",
-            If((beats_total != 0) &
+            If(rd_error,
+                # Return exactly one header-only error completion after the FIFO was drained.
+                If(cmp.valid & cmp.ready,
+                    NextState("IDLE"),
+                )
+            ).Elif((beats_total != 0) &
                (beats_sent  == beats_total) &
                (beats_left  == 0) &
                (rd_outstanding == 0) &
@@ -792,6 +816,14 @@ class LiteNVMeHostMemDMA(LiteXModule):
             ),
             If(pop,
                 beats_sent.eq(beats_sent + 1),
+            ),
+            # Clear poison state once per accepted MemRd and accumulate errors only on an
+            # accepted AXI R response. Clear it after the single error handshake as well,
+            # so an empty FIFO in IDLE cannot publish a second error completion.
+            If(read_accept | (pop & rd_error),
+                rd_error.eq(0),
+            ).Elif(r_fire & (self.axi.r.resp != axi.RESP_OKAY),
+                rd_error.eq(1),
             ),
         ]
 
