@@ -549,10 +549,11 @@ class LiteNVMeCore(SoCCore):
                 *pins_rd,
             )
         ]
-        # A failed read can retire after a valid prefix. Abort only on that
-        # transfer's busy falling edge so sticky error cannot cancel a later check.
+        # A failed read can retire after a valid prefix. Abort only an active checker
+        # on the transfer's busy falling edge, so an idle checker is not tainted by
+        # an errored write and sticky error cannot cancel a later check.
         self.sync += retired_busy.eq(st.busy)
-        self.comb += chk.abort.eq(retired_busy & ~st.busy & st.error & mux.pattern)
+        self.comb += chk.abort.eq(retired_busy & ~st.busy & st.error & mux.pattern & chk.busy)
 
 # Build --------------------------------------------------------------------------------------------
 

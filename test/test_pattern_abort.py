@@ -212,6 +212,44 @@ class TestPatternAbort(unittest.TestCase):
             "busy": 0, "done": 1, "last_error": 0, "beats": 16, "errors": 0,
         })
 
+    def test_stream_ring_does_not_abort_idle_checker_on_write_error(self):
+        width = 256
+        dut = LiteXModule()
+        streamer = _StreamStub(width)
+        LiteNVMeCore.add_stream_ring(
+            dut, _Platform(width), streamer, width, Signal(reset=1), "csr", with_pattern=True,
+        )
+        checker = dut.nvme_pattern_check
+        mux = dut.nvme_stream_mux
+        result = {}
+
+        def bench():
+            yield mux._sel.fields.pattern.eq(1)
+            yield streamer.write.eq(1)
+            yield streamer.error.eq(0)
+            yield streamer.busy.eq(1)
+            yield  # Arm the previous-busy sampler for the errored write.
+            yield streamer.busy.eq(0)
+            yield streamer.error.eq(1)
+            yield
+            result["abort"] = (yield checker.abort)
+            yield
+            result["status"] = {
+                "busy": (yield checker.busy),
+                "done": (yield checker.done),
+                "last_error": (yield checker.last_error),
+                "beats": (yield checker.beats),
+                "errors": (yield checker.errors),
+                "first_err": (yield checker.first_err),
+            }
+
+        run_simulation(dut, bench())
+        self.assertEqual(result["abort"], 0)
+        self.assertEqual(result["status"], {
+            "busy": 0, "done": 1, "last_error": 0,
+            "beats": 0, "errors": 0, "first_err": 0,
+        })
+
 
 if __name__ == "__main__":
     unittest.main()
