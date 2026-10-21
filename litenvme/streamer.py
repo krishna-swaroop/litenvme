@@ -20,7 +20,8 @@ slot N and the completion of slot N-1 all overlap:
             device may complete in any order), then returned to FREE.
 
 Slot states: FREE -> BUSY (submitted, SSD owns the buffer) -> FREE (write) or
-             FREE -> BUSY -> READY (completed, data valid) -> FREE (read, after drain).
+             FREE -> BUSY -> READY -> FREE (successful read), or
+             FREE -> BUSY -> FAILED -> FREE (failed read, after queued commands retire).
 
 A slot is never refilled or re-submitted while the device may still access it, and read data
 is only exposed after its completion. Completions are matched to slots with the engine request
@@ -58,7 +59,8 @@ from litenvme.io_engine import request_layout, completion_layout, TAG_WIDTH
 
 SLOT_FREE  = 0
 SLOT_BUSY  = 1  # Submitted: the SSD owns the buffer.
-SLOT_READY = 2  # Read completed: data valid, waiting to be drained.
+SLOT_READY  = 2  # Read completed successfully: data valid, waiting to be drained.
+SLOT_FAILED = 3  # Read completed with an NVMe status error: buffer data is invalid.
 
 # Stream DMA ---------------------------------------------------------------------------------------
 
@@ -94,7 +96,7 @@ class LiteNVMeStreamDMA(LiteXModule):
         # # #
 
         beat_bytes = data_width // 8
-        axsize     = axi.AXSIZE[beat_bytes]
+        axsize     = log2_int(beat_bytes)
 
         adr        = Signal(address_width)  # Next AW/AR address.
         issue_left = Signal(32)             # Beats still to issue (AW+W or AR).
@@ -251,8 +253,9 @@ class LiteNVMeStreamer(LiteXModule):
         self.rd_source = stream.Endpoint([("data", data_width)])
 
         # Control / status.
-        self.start = Signal()
-        self.write = Signal()
+        self.start    = Signal()
+        self.start_en = Signal(reset=1)  # qualifies `start` (e.g. tie to the core's init_done).
+        self.write    = Signal()
         self.lba   = Signal(64)
         self.count = Signal(32)
         self.nsid  = Signal(32, reset=1)
@@ -313,6 +316,7 @@ class LiteNVMeStreamer(LiteXModule):
         slot_state = [Signal(2, name=f"slot{i}_state") for i in range(nslots)]
         slot_arr   = Array(slot_state)
         busy_count = Signal(max=nslots + 1)
+        read_fail_seen = Signal()  # Stops queuing new reads after the first error completion.
 
         # Registered done (request_gen/block idiom: 1 at idle, cleared by start).
         done_r = Signal(reset=1)
@@ -324,11 +328,13 @@ class LiteNVMeStreamer(LiteXModule):
         # Command push (write: from the fill FSM; read: from the issue logic).
         wr_cmd_valid = Signal()
         rd_cmd_valid = Signal()
+        read_error_completion = Signal()
         push_ptr     = Signal(max=nslots)
         push         = Signal()
         self.comb += [
             rd_cmd_valid.eq((fsm.ongoing("RD-WAIT") | fsm.ongoing("RD-DRAIN")) &
-                            (i_left != 0) & (slot_arr[i_ptr] == SLOT_FREE)),
+                            (i_left != 0) & (slot_arr[i_ptr] == SLOT_FREE) &
+                            ~read_fail_seen & ~read_error_completion),
             push_ptr.eq(Mux(w_write, d_ptr, i_ptr)),
             cmd_fifo.sink.valid.eq(wr_cmd_valid | rd_cmd_valid),
             cmd_fifo.sink.op.eq(w_write),
@@ -362,20 +368,25 @@ class LiteNVMeStreamer(LiteXModule):
             cpl_tag_ok.eq((self.sink.tag < nslots) & (slot_arr[self.sink.tag] == SLOT_BUSY)),
             cpl_ok.eq(self.sink.valid & cpl_tag_ok),
             cpl_err.eq((cpl_sc != 0) | (cpl_sct != 0)),
+            read_error_completion.eq(cpl_ok & cpl_err & ~w_write),
         ]
 
-        # Drain completion (read slot handed back).
+        # Drain/retire events (read slot handed back, or failed transfer fully quiesced).
         drain_done = Signal()
 
         # Per-slot state updates. In any cycle these events target distinct slots (a completion
         # targets a BUSY slot, a push a FREE one, a drain a READY one), so priority is moot.
         clear_slots = Signal()
+        retire_slots = Signal()
+        clear_slot_states = Signal()
+        self.comb += clear_slot_states.eq(clear_slots | retire_slots)
         for i in range(nslots):
             self.sync += [
-                If(clear_slots,
+                If(clear_slot_states,
                     slot_state[i].eq(SLOT_FREE),
                 ).Elif(cpl_ok & (self.sink.tag == i),
-                    slot_state[i].eq(Mux(w_write, SLOT_FREE, SLOT_READY)),
+                    slot_state[i].eq(Mux(w_write, SLOT_FREE,
+                                         Mux(cpl_err, SLOT_FAILED, SLOT_READY))),
                 ).Elif(push & (push_ptr == i),
                     slot_state[i].eq(SLOT_BUSY),
                 ).Elif(drain_done & (d_ptr == i),
@@ -385,7 +396,7 @@ class LiteNVMeStreamer(LiteXModule):
 
         # Busy-slot count / high-water (BUSY or READY: not yet reusable).
         self.sync += [
-            If(clear_slots,
+            If(clear_slot_states,
                 busy_count.eq(0),
             ).Elif(push & ~(w_write & cpl_ok) & ~drain_done,
                 busy_count.eq(busy_count + 1),
@@ -430,6 +441,13 @@ class LiteNVMeStreamer(LiteXModule):
                 ),
             ),
         ]
+        self.sync += [
+            If(clear_slots,
+                read_fail_seen.eq(0),
+            ).Elif(read_error_completion,
+                read_fail_seen.eq(1),
+            )
+        ]
         self.comb += self.error.eq((self.err_count != 0) | (self.stale_count != 0))
 
         # Outstanding commands (queued or at the device).
@@ -443,7 +461,7 @@ class LiteNVMeStreamer(LiteXModule):
         ]
 
         fsm.act("IDLE",
-            If(self.start,
+            If(self.start & self.start_en,
                 clear_slots.eq(1),
                 NextValue(w_write, self.write),
                 NextValue(w_nsid,  self.nsid),
@@ -488,7 +506,9 @@ class LiteNVMeStreamer(LiteXModule):
 
         # Read: drain slots in order as they complete (commands are issued concurrently).
         fsm.act("RD-WAIT",
-            If(d_left == 0,
+            If(slot_arr[d_ptr] == SLOT_FAILED,
+                NextState("RD-FAILED"),
+            ).Elif(d_left == 0,
                 NextState("FINISH"),
             ).Elif(slot_arr[d_ptr] == SLOT_READY,
                 dma.start.eq(1),
@@ -505,6 +525,17 @@ class LiteNVMeStreamer(LiteXModule):
                 NextValue(d_left, d_left - d_nlb),
                 ptr_inc(d_ptr),
                 NextState("RD-WAIT"),
+            )
+        )
+
+        # The failed slot is an ordered boundary: successful slots before it have drained,
+        # while the failed slot and all later slots remain hidden. Unissued work is abandoned;
+        # wait only for commands already pushed to the engine.
+        fsm.act("RD-FAILED",
+            If(outstanding == 0,
+                retire_slots.eq(1),
+                NextValue(done_r, 1),
+                NextState("IDLE"),
             )
         )
 

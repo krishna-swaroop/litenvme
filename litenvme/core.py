@@ -93,6 +93,7 @@ class LiteNVMe(LiteXModule):
                  staging_base=0x4_0000, staging_size=0x4_0000, with_csr=True,
                  with_streamer=False, streamer_csr=True, streamer_base=0x2000_0000,
                  streamer_nslots=8, streamer_slot_bytes=0x8000, streamer_backend=None,
+                 prp_list_shift=None,
                  with_accessor_csr=None, with_engine_csr=None, with_request_gen_csr=None,
                  extra_axi_masters=None):
         # hostmem_backend: optional pre-built host-memory backend exposing a matching
@@ -107,6 +108,8 @@ class LiteNVMe(LiteXModule):
         # drive `self.request`/`self.completion` from your own logic.
         self.pcie_endpoint = pcie_endpoint
         endpoint = pcie_endpoint
+        # The endpoint (and its PHY) belong to the SoC: don't re-export their CSRs under ours.
+        self.autocsr_exclude = {"pcie_endpoint"}
 
         if data_width is None:
             data_width = endpoint.phy.data_width
@@ -150,7 +153,7 @@ class LiteNVMe(LiteXModule):
         # Hardware I/O command engine (engine + dword->AXI bridge).
         self.io_engine = io_engine = LiteNVMeIOEngineAXI(
             qid=qid, qsize=qsize, qd=qd, data_width=data_width, with_csr=with_engine_csr,
-            hostmem_base=hostmem_base)
+            hostmem_base=hostmem_base, prp_list_shift=prp_list_shift)
 
         # Engine front-ends share one AXI backend; build them before the responder so their
         # masters join the arbiter. Front-ends (request_gen, block streamer, external logic)
@@ -247,7 +250,15 @@ class LiteNVMe(LiteXModule):
         Convenience for SoC integration. Call after instantiating the core, e.g.:
             self.nvme = LiteNVMe(self.pcie_endpoint, ...)
             self.nvme.add_csrs(self)
+
+        The registered sub-blocks are then excluded from the core's own CSR gathering, so each
+        CSR lives in exactly one bank (LiteX gathers CSRs from every reachable attribute; a
+        CSR reachable through two banks gets two bus decoders driving the same strobes).
         """
+        self.autocsr_exclude = set(self.autocsr_exclude) | {
+            "cfg", "mmio", "mmio_db", "io_engine", "hostmem", "request_gen", "block_streamer",
+            "streamer", "streamer_mem",
+        }
         if self.with_accessor_csr:
             soc.add_module(name=f"{name}_cfg",    module=self.cfg)
             soc.add_module(name=f"{name}_mmio",   module=self.mmio)

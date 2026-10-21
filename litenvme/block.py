@@ -73,7 +73,7 @@ class LiteNVMeHostMemStreamDMA(LiteXModule):
 
         beat_bytes       = data_width // 8
         beat_bytes_shift = log2_int(beat_bytes)
-        axsize           = axi.AXSIZE[beat_bytes]
+        axsize           = log2_int(beat_bytes)
 
         cur_adr    = Signal(address_width)
         beats_left = Signal(32)
